@@ -20,6 +20,16 @@ $ ./run
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+
+#define MIN_RANK 10
+
+int max(int a, int b) {
+    return a > b ? a : b;
+}
+int min(int a, int b) {
+    return a < b ? a : b;
+}
+
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
@@ -40,10 +50,11 @@ typedef struct {
     float* rms_att_weight; // (layer, dim) rmsnorm weights
     float* rms_ffn_weight; // (layer, dim)
     // weights for matmuls
-    float* wq; // (layer, dim, dim)
-    float* wk; // (layer, dim, dim)
-    float* wv; // (layer, dim, dim)
-    float* wo; // (layer, dim, dim)
+    float* wq; // (layer, dim, dim) + SVD at each layer: U (dim, dim), S (dim), Vh (dim, dim)
+    float* wk; // (layer, dim, dim) + SVD
+    float* wv; // (layer, dim, dim) + SVD
+    float* wo; // (layer, dim, dim) + SVD
+
     // weights for ffn
     float* w1; // (layer, hidden_dim, dim)
     float* w2; // (layer, dim, hidden_dim)
@@ -64,6 +75,7 @@ typedef struct {
     float *xb2; // an additional buffer just for convenience (dim,)
     float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
     float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+    float *lowrank_inter; // intermediate result for lowrank matmul (dim,)
     float *q; // query (dim,)
     float *k; // key (dim,)
     float *v; // value (dim,)
@@ -72,6 +84,11 @@ typedef struct {
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
+    // Retained rank of the SVD decomposition of each attention matrix at each layer.
+    int *rankq; // (layer)
+    int *rankk; // (layer)
+    int *rankv; // (layer)
+    int *ranko; // (layer)
 } RunState;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -81,6 +98,7 @@ void malloc_run_state(RunState* s, Config* p) {
     s->xb2 = calloc(p->dim, sizeof(float));
     s->hb = calloc(p->hidden_dim, sizeof(float));
     s->hb2 = calloc(p->hidden_dim, sizeof(float));
+    s->lowrank_inter = calloc(p->dim, sizeof(float));
     s->q = calloc(p->dim, sizeof(float));
     s->k = calloc(p->dim, sizeof(float));
     s->v = calloc(p->dim, sizeof(float));
@@ -95,6 +113,56 @@ void malloc_run_state(RunState* s, Config* p) {
         printf("malloc failed!\n");
         exit(1);
     }
+    s->rankq = calloc(p->n_layers, sizeof(int));
+    s->rankk = calloc(p->n_layers, sizeof(int));
+    s->rankv = calloc(p->n_layers, sizeof(int));
+    s->ranko = calloc(p->n_layers, sizeof(int));
+}
+
+int get_rank(float *s, int n, float threshold) {
+    int r = 0;
+    int i = 0;
+    while (i < n && s[i] > threshold) {
+        r++;
+        i++;
+    }
+    return r;
+}
+
+void set_eigenvalue_thresholds(float q_threshold, float k_threshold, float v_threshold, float o_threshold, Config* p, TransformerWeights* w, RunState* s) {
+    // set the eigenvalue thresholds for the SVD decompositions
+    size_t total_original_size = 0;
+    size_t total_saved_size = 0;
+
+    for (int i = 0; i < p->n_layers; i++) {
+        s->rankq[i] = max(MIN_RANK, get_rank(w->wq + i * (p->dim*p->dim*3 + p->dim) + p->dim*p->dim*2, p->dim, q_threshold));
+        s->rankk[i] = max(MIN_RANK, get_rank(w->wk + i * (p->dim*p->dim*3 + p->dim) + p->dim*p->dim*2, p->dim, k_threshold));
+        s->rankv[i] = max(MIN_RANK, get_rank(w->wv + i * (p->dim*p->dim*3 + p->dim) + p->dim*p->dim*2, p->dim, v_threshold));
+        s->ranko[i] = max(MIN_RANK, get_rank(w->wo + i * (p->dim*p->dim*3 + p->dim) + p->dim*p->dim*2, p->dim, o_threshold));
+
+        printf("layer %d: rankq=%d rankk=%d rankv=%d ranko=%d\n", i, s->rankq[i], s->rankk[i], s->rankv[i], s->ranko[i]);
+
+        size_t original_size = (p->dim * p->dim);
+        total_original_size += original_size * 4;
+        
+        size_t q_lora_size = 2 * p->dim * s->rankq[i];
+        total_saved_size += original_size - min(original_size, q_lora_size);
+
+        size_t k_lora_size = 2 * p->dim * s->rankk[i];
+        total_saved_size += original_size - min(original_size, k_lora_size);
+
+        size_t v_lora_size = 2 * p->dim * s->rankv[i];
+        total_saved_size += original_size - min(original_size, v_lora_size);
+
+        size_t o_lora_size = 2 * p->dim * s->ranko[i];
+        total_saved_size += original_size - min(original_size, o_lora_size);
+    }
+
+    printf("total original size: %zu\n", total_original_size * sizeof(float));
+    printf("total saved size: %zu\n", total_saved_size * sizeof(float));
+    printf("saved ratio: %f\n", (float)total_saved_size / total_original_size);
+    printf("reduction factor: %f\n", (float)total_original_size/(total_original_size - total_saved_size));
+    
 }
 
 void free_run_state(RunState* s) {
@@ -110,6 +178,10 @@ void free_run_state(RunState* s) {
     free(s->logits);
     free(s->key_cache);
     free(s->value_cache);
+    free(s->rankq);
+    free(s->rankk);
+    free(s->rankv);
+    free(s->ranko);
 }
 
 // ----------------------------------------------------------------------------
@@ -122,13 +194,13 @@ void checkpoint_init_weights(TransformerWeights *w, Config* p, float* f, int sha
     w->rms_att_weight = ptr;
     ptr += p->n_layers * p->dim;
     w->wq = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
+    ptr += p->n_layers * (p->dim * p->dim * 3 + p->dim); // weights, U_weights, S_weights, Vh_weights
     w->wk = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
+    ptr += p->n_layers * (p->dim * p->dim * 3 + p->dim); // weights, U_weights, S_weights, Vh_weights
     w->wv = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
+    ptr += p->n_layers * (p->dim * p->dim * 3 + p->dim); // weights, U_weights, S_weights, Vh_weights
     w->wo = ptr;
-    ptr += p->n_layers * p->dim * p->dim;
+    ptr += p->n_layers * (p->dim * p->dim * 3 + p->dim); // weights, U_weights, S_weights, Vh_weights
     w->rms_ffn_weight = ptr;
     ptr += p->n_layers * p->dim;
     w->w1 = ptr;
@@ -191,17 +263,57 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
+void matmul_stride(float* xout, float* x, float* w, int n, int d, int stride) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
+    // printf("matmul_stride: n=%d d=%d stride=%d\n", n, d, stride);
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
+            val += w[i * stride + j] * x[j];
         }
         xout[i] = val;
+    }
+}
+
+void matmul(float* xout, float* x, float* w, int n, int d) {
+    matmul_stride(xout, x, w, n, d, /* stride= */ n);
+}
+
+void matmul_svd(float* xout, float* xinter, float* x, float* wu, float* s, float* wvh, int n, int d, int r) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // U (d,r) @ S (r, r) @ Vh (r, n) @ x (n,) -> xout (d,)
+    //   S is actually just the diagonal so more (r,)
+    // If d == n && r == d == n then this simplifies to
+    //   U (d,d) @ S (d, n) @ Vh (n, n) @ x (n,) -> xout (d,)
+
+    int i;
+    matmul_stride(xinter, x, wvh, n, r, n);
+    
+    // S was premultiplied in U
+    // #pragma omp parallel for private(i)
+    // for (i = 0; i < r; i++) {
+    //     xinter[i] *= s[i];
+    // }
+    
+    matmul_stride(xout, xinter, wu, r, d, d);
+}
+
+
+void matmul_square_svd_rank(float* xout, float* xinter, float* x, float *weights, int n, int r) {
+    // if (r >= n / 2) {
+    //     matmul(xout, x, weights, n, n);
+    // } else 
+    {
+        // printf(".");
+        int ns = n * n;
+        float* wu = weights + ns;
+        float* s = wu + ns;
+        float* wvh = s + n;
+
+        matmul_svd(xout, xinter, x, wu, s, wvh, n, n, r);
     }
 }
 
@@ -228,9 +340,15 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
         // qkv matmuls for this position
+        #if 0
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*dim, dim, dim);
         matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
+        #else
+        matmul_square_svd_rank(s->q, s->lowrank_inter, s->xb, w->wq + l*(dim*dim*3 + dim), dim, s->rankq[l]);
+        matmul_square_svd_rank(s->k, s->lowrank_inter, s->xb, w->wk + l*(dim*dim*3 + dim), dim, s->rankk[l]);
+        matmul_square_svd_rank(s->v, s->lowrank_inter, s->xb, w->wv + l*(dim*dim*3 + dim), dim, s->rankv[l]);
+        #endif
 
         // apply RoPE rotation to the q and k vectors for each head
         for (int h = 0; h < p->n_heads; h++) {
@@ -300,7 +418,11 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the attention
+        #if 0
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        #else
+        matmul_square_svd_rank(s->xb2, s->lowrank_inter, s->xb, w->wo + l*(dim*dim*3 + dim), dim, s->ranko[l]);
+        #endif
 
         // residual connection back into x
         accum(x, s->xb2, dim);
@@ -476,7 +598,7 @@ int main(int argc, char *argv[]) {
     }
 
     // seed rng with time. if you want deterministic behavior use temperature 0.0
-    rng_seed = (unsigned int)time(NULL);
+    rng_seed = getenv("SEED") ? atoi(getenv("SEED")) : (unsigned int)time(NULL);
 
     // read in the model.bin file
     Config config;
@@ -529,6 +651,12 @@ int main(int argc, char *argv[]) {
     // create and init the application RunState
     RunState state;
     malloc_run_state(&state, &config);
+
+    float q_threshold = getenv("Q") ? atof(getenv("Q")) : 0.0f;
+    float k_threshold = getenv("K") ? atof(getenv("K")) : 0.0f;
+    float v_threshold = getenv("V") ? atof(getenv("V")) : 0.0f;
+    float o_threshold = getenv("O") ? atof(getenv("O")) : 0.0f;
+    set_eigenvalue_thresholds(q_threshold, k_threshold, v_threshold, o_threshold, &config, &weights, &state);
 
     // process the prompt, if any
     int *prompt_tokens = NULL;

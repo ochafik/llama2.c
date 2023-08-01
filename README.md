@@ -13,7 +13,18 @@ Please note that this started recently as just a fun weekend project: I took my 
 Let's just run a baby Llama 2 model in C. You need a model checkpoint. Download this 15M parameter model I trained on the [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset (~60MB download):
 
 ```bash
-wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+( cd ~/AI/Models && wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.pt )
+mv ~/AI/Models/{,llama2.c.}stories15M.pt
+
+( cd ~/AI/Models && wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.pt )
+mv ~/AI/Models/{,llama2.c.}stories110M.pt
+
+EXPORT_SVD=1 python export_meta_llama_bin.py ~/AI/Models/llama2.c.stories15M.{pt,svd.bin}
+EXPORT_SVD=1 python export_meta_llama_bin.py ~/AI/Models/llama2.c.stories110M.{pt,svd.bin}
+
+make clean && make runfast && SEED=1212 Q=1.4 ./run ~/AI/Models/llama2.c.stories110M.svd.bin 1
+make clean && make runfast && hyperfine --warmup 1 "SEED=1212 Q=1.4 ./run ~/AI/Models/llama2.c.stories15M.svd.bin 0"
+
 ```
 
 Compile and run the C code:

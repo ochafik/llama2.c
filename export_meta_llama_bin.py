@@ -22,7 +22,37 @@ def export(p, state_dict, filepath='model.bin'):
         f.write(memoryview(t))
         del state_dict[key]
 
+    def serialize_with_svd(key):
+        if os.environ.get('EXPORT_SVD', '0') == '0':
+            serialize(key)
+            return
+        print(f"writing {key} w/ SVD...")
+        weights = state_dict[key]
+        U, S, Vh = torch.linalg.svd(weights)
+        # print(S.shape)
+        # print(S)
+        n, m = weights.shape
+        assert n == m
+        assert U.shape == (n, n)
+        assert S.shape == (n,)
+        assert Vh.shape == (n, n)
+
+        t = weights.contiguous().view(-1).type(torch.float32).numpy()
+        # U = U.contiguous().view(-1).type(torch.float32).numpy()
+        US = U @ torch.diag(S)
+        US = US.contiguous().view(-1).type(torch.float32).numpy()
+        S = S.contiguous().view(-1).type(torch.float32).numpy()
+        Vh = Vh.contiguous().view(-1).type(torch.float32).numpy()
+
+        f.write(memoryview(t))
+        # f.write(memoryview(U))
+        f.write(memoryview(US))
+        f.write(memoryview(S))
+        f.write(memoryview(Vh))
+        del state_dict[key]
+
     # first write out the header
+    # print(state_dict)
     hidden_dim = state_dict['layers.0.feed_forward.w1.weight'].shape[0]
     p['vocab_size'] = 32000
     p['max_seq_len'] = 2048
@@ -44,10 +74,11 @@ def export(p, state_dict, filepath='model.bin'):
     # now all the layers
     # attention weights
     for i in range(p['n_layers']): serialize(f'layers.{i}.attention_norm.weight')
-    for i in range(p['n_layers']): serialize(f'layers.{i}.attention.wq.weight')
-    for i in range(p['n_layers']): serialize(f'layers.{i}.attention.wk.weight')
-    for i in range(p['n_layers']): serialize(f'layers.{i}.attention.wv.weight')
-    for i in range(p['n_layers']): serialize(f'layers.{i}.attention.wo.weight')
+    for i in range(p['n_layers']): serialize_with_svd(f'layers.{i}.attention.wq.weight')
+    for i in range(p['n_layers']): serialize_with_svd(f'layers.{i}.attention.wk.weight')
+    for i in range(p['n_layers']): serialize_with_svd(f'layers.{i}.attention.wv.weight')
+    for i in range(p['n_layers']): serialize_with_svd(f'layers.{i}.attention.wo.weight')
+
     # ffn weights
     for i in range(p['n_layers']): serialize(f'layers.{i}.ffn_norm.weight')
     for i in range(p['n_layers']): serialize(f'layers.{i}.feed_forward.w1.weight')
