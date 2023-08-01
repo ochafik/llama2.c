@@ -90,15 +90,19 @@ def concat_weights(models):
 
 
 def load_and_export(model_path, output_path):
-    params_path = os.path.join(model_path, 'params.json')
-    with open(params_path) as f:
-        params = json.load(f)
-        print(params)
-
-    model_paths = sorted(list(Path(model_path).glob('consolidated.*.pth')))
-    models = [torch.load(p, map_location='cpu') for p in model_paths]
-    state_dict = concat_weights(models)
-    del models
+    if model_path.endswith('.pt'):
+        model = torch.load(model_path, map_location='cpu')
+        state_dict = model['model']
+        params = model['model_args']
+    else:
+        params_path = os.path.join(model_path, 'params.json')
+        with open(params_path) as f:
+            params = json.load(f)
+            print(params)
+        model_paths = sorted(list(Path(model_path).glob('consolidated.*.pth')))
+        models = [torch.load(p, map_location='cpu') for p in model_paths]
+        state_dict = concat_weights(models)
+        del models
     export(params, state_dict, output_path)
 
 
