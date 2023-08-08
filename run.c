@@ -84,6 +84,7 @@ typedef struct {
 typedef struct {
     char *str;
     int id;
+    int n_descendants;
 } TokenIndex;
 
 typedef struct {
@@ -379,14 +380,21 @@ int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
-int lookup_token(const char *str, const Vocabulary *v) {
-    int left = 0, right = v->vocab_size - 1;
+int lookup_sorted_token(const char *prefix, const char *str, const Vocabulary *v, int offset, int length) {
+    int prefix_len = strlen(prefix);
+    int left = offset, right = offset + length - 1;
     while (left <= right) {
         int mid = (left + right) / 2;
-        int res = strcmp(str, v->sorted_vocab[mid].str);
-        if (res == 0) { return v->sorted_vocab[mid].id; }
-        else if (res < 0) { right = mid - 1; }
-        else { left = mid + 1; }
+        const char *candidate = v->sorted_vocab[mid].str;
+        if (prefix_len && (strncmp(prefix, candidate, prefix_len) != 0)) {
+            // We've gone past the prefix
+            right = mid - 1;
+        } else {
+            int res = strcmp(str, candidate + prefix_len);
+            if (res == 0) { return mid; }
+            else if (res < 0) { right = mid - 1; }
+            else { left = mid + 1; }
+        }
     }
     return -1;
 }
@@ -409,12 +417,30 @@ bool build_vocab(const char *filename, Vocabulary *v) {
         v->sorted_vocab[i].id = i;
     }
     qsort(v->sorted_vocab, v->vocab_size, sizeof(TokenIndex), compare_tokens);
+
+    for (int i = 0; i < v->vocab_size; i++) {
+        TokenIndex *token1 = &v->sorted_vocab[i];
+        const char *str1 = token1->str;
+        int str1_len = strlen(str1);
+        if (!str1_len) { continue; }
+        for (int j = i + 1; j < v->vocab_size; j++) {
+            if (strncmp(str1, v->sorted_vocab[j].str, str1_len) != 0) { 
+                token1->n_descendants = j - i - 1;
+                break;
+            }
+            if (j == v->vocab_size - 1) {
+                token1->n_descendants = j - i;
+            }
+        }
+    }
     return true;
 }
 
-int lookup_merge(int token1, int token2, char *str_buffer, const Vocabulary *v) {
-    sprintf(str_buffer, "%s%s", v->vocab[token1], v->vocab[token2]);
-    return lookup_token(str_buffer, v);
+int lookup_merge(int sorted_token_idx1, int sorted_token_idx2, const Vocabulary *v) {
+    TokenIndex *token1 = &v->sorted_vocab[sorted_token_idx1];
+    const char *str2 = v->sorted_vocab[sorted_token_idx2].str;
+
+    return lookup_sorted_token(token1->str, str2, v, sorted_token_idx1, token1->n_descendants);
 }
 
 void bpe_encode(char *text, const Vocabulary *v, int *tokens, int *n_tokens) {
@@ -423,17 +449,18 @@ void bpe_encode(char *text, const Vocabulary *v, int *tokens, int *n_tokens) {
 
     // first encode every individual byte in the input string
     *n_tokens = 0; // the number of tokens
+    int *sorted_token_idxs = calloc(strlen(text), sizeof(int));
     for (char *c = text; *c != '\0'; c++) {
         sprintf(str_buffer, "%c", *c);
-        int id = lookup_token(str_buffer, v);
-        if (id == -1) { fprintf(stderr, "not good\n"); exit(EXIT_FAILURE); }
-        tokens[*n_tokens] = id;
+        int sorted_idx = lookup_sorted_token("", str_buffer, v, 0, v->vocab_size);
+        if (sorted_idx == -1) { fprintf(stderr, "not good\n"); exit(EXIT_FAILURE); }
+        sorted_token_idxs[*n_tokens] = sorted_idx;
         (*n_tokens)++;
     }
 
     int *possible_merges = calloc(*n_tokens - 1, sizeof(int));
     for (int i = 0; i < (*n_tokens - 1); i++) {
-        possible_merges[i] = lookup_merge(tokens[i], tokens[i+1], str_buffer, v);
+        possible_merges[i] = lookup_merge(sorted_token_idxs[i], sorted_token_idxs[i+1], v);
     }
 
     // merge the best consecutive pair each iteration, according the scores in vocab_scores
@@ -443,7 +470,7 @@ void bpe_encode(char *text, const Vocabulary *v, int *tokens, int *n_tokens) {
         int best_idx = -1;
 
         for (int i=0; i < (*n_tokens-1); i++) {
-            // check if we can merge the pair (tokens[i], tokens[i+1])
+            // check if we can merge the pair (sorted_token_idxs[i], sorted_token_idxs[i+1])
             int id = possible_merges[i];
             if (id != -1 && v->vocab_scores[id] > best_score) {
                 // this merge pair exists in vocab! record its score and position
@@ -458,18 +485,21 @@ void bpe_encode(char *text, const Vocabulary *v, int *tokens, int *n_tokens) {
         }
 
         // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-        tokens[best_idx] = best_id;
+        sorted_token_idxs[best_idx] = best_id;
         // delete token at position best_idx+1, shift the entire sequence back 1
         for (int i = best_idx+1; i < (*n_tokens-1); i++) {
-            tokens[i] = tokens[i+1];
+            sorted_token_idxs[i] = sorted_token_idxs[i+1];
             possible_merges[i] = possible_merges[i+1];
         }
         (*n_tokens)--; // token length decreased
         // update possible merge pairs on the left and right of the merged pair
-        if (best_idx < (*n_tokens-1)) { possible_merges[best_idx]   = lookup_merge(tokens[best_idx],   tokens[best_idx+1], str_buffer, v); }
-        if (best_idx > 0)             { possible_merges[best_idx-1] = lookup_merge(tokens[best_idx-1], tokens[best_idx],   str_buffer, v); }
+        if (best_idx < (*n_tokens-1)) { possible_merges[best_idx]   = lookup_merge(sorted_token_idxs[best_idx],   sorted_token_idxs[best_idx+1], v); }
+        if (best_idx > 0)             { possible_merges[best_idx-1] = lookup_merge(sorted_token_idxs[best_idx-1], sorted_token_idxs[best_idx],   v); }
     }
 
+    for (int i = 0; i < *n_tokens; i++) { tokens[i] = v->sorted_vocab[sorted_token_idxs[i]].id; }
+
+    free(sorted_token_idxs);
     free(str_buffer);
 }
 
